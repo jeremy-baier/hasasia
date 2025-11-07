@@ -3,12 +3,18 @@ from __future__ import print_function
 """Real data module."""
 import numpy as np
 import scipy.linalg as sl
+import copy
 from astropy import units as u
 import jax.numpy as jnp
 import jax.scipy as jsc
 import glob
 import hasasia.sensitivity as hsen
 import hasasia.utils as hutils
+try:
+    import enterprise_extensions.chromatic.solar_wind as ee_sw
+    import enterprise_extensions.gp_kernels as gpk
+except ImportError:
+    print("can't use all functionality w/o enterprise_extensions installed")
 
 fyr = 1/(365.25*24*3600)
 
@@ -187,10 +193,14 @@ def get_febes(ePsr):
     return new_flgs
 
 
-def white_noise_corr(psr,
-                    noise_dict,
-                    equad_convention='tnequad',
-                    ecorr_settings='NANOGrav'):
+def white_noise_corr(pname,
+                     toas,
+                     toaerrs,
+                     febes,
+                     unique_frontend_backend,
+                     noise_dict,
+                     equad_convention='tnequad',
+                     ecorr_settings='NANOGrav'):
     """
     Function to make white noise correlation matrix.
     Formerly, `make_corr` in the real data tutorial.
@@ -216,50 +226,46 @@ def white_noise_corr(psr,
     """
 
     # setup the matrix to be Ntoa x Ntoa
-    N = psr.toaerrs.size
+    N = toaerrs.size
     corr = np.zeros((N,N))
-    # get the flagging conventions for PTAs
-    flags_by_pta = get_flags_by_pta(psr=psr)
-    # get the unique frontend/backend combinations
-    unique_frontend_backend = noise_flags(flags_by_pta, psr=psr)
-    # create a new flag to use
-    febes = get_febes(psr)
     # quantize new flag -- i wonder what happens if 2 ptas take measurements at the same time ??
-    _, _, flags_quantized, _, bi = hsen.quantize_fast(psr,febes,dt=0.1, flags_only=True)
+    _, _, flags_quantized, _, bi = hsen.quantize_fast(toas, toaerrs, febes, dt=0.1, flags_only=True)
     sigma_sqr = np.zeros(N)
     ecorrs = np.zeros_like(flags_quantized,dtype=float)
     # FIXME: try to get rid of the the try/ accept
     for unique_febe in unique_frontend_backend:
         mask = np.where(unique_febe==febes)
         try:
-            key_ef = '{0}_{1}_{2}'.format(psr.name, unique_febe,'efac')
+            key_ef = '{0}_{1}_{2}'.format(pname, unique_febe,'efac')
             efac = noise_dict[key_ef]
         except KeyError:
             efac = 1
-            print(f'No efac for {psr.name} {unique_febe}')
+            print(f'No efac for {pname} {unique_febe}')
         try:
-            key_eq = '{0}_{1}_log10_{2}'.format(psr.name, unique_febe,'tnequad')
+            key_eq = '{0}_{1}_log10_{2}'.format(pname, unique_febe, equad_convention)
             equad = 10**noise_dict[key_eq]
         except KeyError:
-            print(f'No equad for {psr.name} {unique_febe}')
+            print(f'No equad for {pname} {unique_febe}')
             equad = 0
         if equad_convention == 'tnequad':
             sigma_sqr[mask] = ( # variance_tn = efac^2 * toaerr^2 + equad^2
                                 efac**2 *
-                            (psr.toaerrs[mask])**2 + (10**equad)**2
+                            (toaerrs[mask])**2 + (10**equad)**2
                             )
         elif equad_convention == 't2equad':
             sigma_sqr[mask] = ( # variance_t2 = efac^2 * (toaerr^2 + equad^2)
                                 efac**2 *
-                            ((psr.toaerrs[mask])**2 + (equad)**2)
+                            ((toaerrs[mask])**2 + (equad)**2)
                             )
+        else:
+            raise ValueError("Invalid equad convention specified. Use one of ['tnequad', 't2equad']")
         if ecorr_settings is not None:
             mask_ec = np.where(flags_quantized==unique_febe)
             try:
-                key_ec = '{0}_{1}_log10_{2}'.format(psr.name,unique_febe,'ecorr')
+                key_ec = '{0}_{1}_log10_{2}'.format(pname,unique_febe,'ecorr')
                 ecorrs[mask_ec] = np.ones_like(mask_ec) * (10**noise_dict[key_ec])
             except KeyError:
-                print(f'No ecorr for {psr.name} {unique_febe}')
+                print(f'No ecorr for {pname} {unique_febe}')
     if ecorr_settings == 'NANOGrav': # some PTAs don't have ecorr
         j = [ecorrs[ii]**2*np.ones((len(bucket),len(bucket)))
             for ii, bucket in enumerate(bi)]
@@ -269,6 +275,135 @@ def white_noise_corr(psr,
         corr = jnp.diag(sigma_sqr)
     return corr
 
+def corr_from_kernel_basis(pname, signal_name, toas, radio_freqs, sw_geometry=None, dt=30, kernel='square_exponential', noise_dict = {}, chromatic_idx=0):
+     """
+     Calculates the correlation matrix over a set of TOAs for a given power
+     spectral density.
+
+     Parameters
+     ----------
+     
+     pname: str
+         pulsar name
+     
+     toas : array
+         Pulsar times-of-arrival to use in correlation matrix.
+
+     radio_freqs : array
+         observation frequency of each ToA
+
+     dt : int
+        the linear interpolation basis size
+
+     kernel : str
+         type of kernel to use choose [square_exponential, rational_quadratic, ridge].
+
+    hyperparams_dict : dictionary
+        a dictionary with the hyperparameters to build the covariance with
+
+    chromatic_idx : float
+         Spectral index of the powerlaw amplitude. 0 for achroamtic, 2 for DM noise, 4 for Chrom.
+
+     Returns
+     -------
+
+         A 2-dimensional array which represents the correlation matrix for the
+         given set of TOAs.
+     """
+    # make U --- note: currently should not work ( correctly ) with thinned toas.
+     if sw_geometry is not None:
+         U, nodes = hutils.linear_interp_basis(toas, dt*86400)
+         dt_DM = hutils.solar_wind_geometric_factor(radio_freqs, sw_geometry[0], sw_geometry[1], sw_geometry[2])
+         U = U * dt_DM[:, None]
+     elif chromatic_idx == 0:
+         U, nodes = hutils.linear_interp_basis(toas, dt*86400)
+     else:
+         U, nodes = hutils.linear_interp_basis_chromatic(toas, radio_freqs, dt*86400, chromatic_idx)
+     # make phi
+     if kernel == 'dmx_like' or kernel == 'ridge':
+        phi = np.diag(10**noise_dict[f'{pname}_{signal_name}_log10_sigma_ridge']*np.ones(len(nodes)))
+     elif kernel == 'sq_exp' or kernel == 'sq_exp_rfband': ### FIXME need to include the other kernels
+        phi = gpk.se_dm_kernel(
+            avetoas=nodes,
+            log10_sigma=noise_dict[f'{pname}_{signal_name}_log10_sigma'],
+            log10_ell=noise_dict[f'{pname}_{signal_name}_log10_ell']
+        )
+     elif kernel == 'periodic' or kernel == 'periodic_rfband': ### FIXME need to include the other kernels
+        phi = gpk.periodic_kernel(
+            avetoas=nodes,
+            log10_sigma=noise_dict[f'{pname}_{signal_name}_log10_sigma'],
+            log10_ell=noise_dict[f'{pname}_{signal_name}_log10_ell'],
+            log10_gam_p=noise_dict[f'{pname}_{signal_name}_log10_gam_p'],
+            log10_p=noise_dict[f'{pname}_{signal_name}_log10_p']
+        )
+     else:
+         raise ValueError(f"Kernel name not recognized: {pname} {signal_name} {kernel}")
+    
+     #if kernel == 'ridge':
+     return U@phi@U.T
+
+def corr_from_nitu_solar_wind(pname, signal_name, toas, radio_freqs, sw_geometry=None, kernel='ridge', noise_dict={}):
+     """
+     Calculates the correlation matrix over a set of TOAs for the Nitu+2024 solar wind model.
+
+     Parameters
+     ----------
+     
+     toas : array
+         Pulsar times-of-arrival to use in correlation matrix.
+
+     radio_freqs : array
+         observation frequency of each ToA
+
+     sw_geometry: array [3, NTOA]
+         array of 3 sw geometry params
+         - planetssb
+         - sunssb
+         - pos_t
+
+     kernel : str
+         type of kernel to use choose [square_exponential, rational_quadratic, ridge].
+
+    hyperparams_dict : dictionary
+        a dictionary with the hyperparameters to build the covariance with
+
+     Returns
+     -------
+
+     corr : array
+         A 2-dimensional array which represents the correlation matrix for the
+         given set of TOAs.
+     """
+     # make V --- note: currently should not work ( correctly ) with thinned toas.
+
+     V, tc = gpk.sw_dm_triangular_basis(toas,
+                                    planetssb=sw_geometry[0],
+                                    sunssb=sw_geometry[1],
+                                    pos_t=sw_geometry[2],
+                                    freqs=radio_freqs,
+                                    fref=1400
+     )
+     # make phi
+     if kernel == 'ridge':
+        phi = np.diag(10**noise_dict[f'{pname}_{signal_name}_log10_sigma_ne']*np.ones(len(tc)))
+     elif kernel == 'sq_exp':
+        phi = gpk.se_dm_kernel(
+            avetoas=nodes,
+            log10_sigma=noise_dict[f'{pname}_{signal_name}_log10_sigma'],
+            log10_ell=noise_dict[f'{pname}_{signal_name}_log10_ell']
+        )
+     elif kernel == 'periodic':
+        phi = gpk.periodic_kernel(
+            avetoas=nodes,
+            log10_sigma=noise_dict[f'{pname}_{signal_name}_log10_sigma'],
+            log10_ell=noise_dict[f'{pname}_{signal_name}_log10_ell'],
+            log10_gam_p=noise_dict[f'{pname}_{signal_name}_log10_gamma_p'],
+            log10_p=noise_dict[f'{pname}_{signal_name}_log10_p']
+        )
+     else:
+         raise ValueError("Kernel name not recognized.")
+    
+     return V@phi@V.T
 
 def corr_from_psd_chromatic(toas, radio_freqs, freqs, psd, chromatic_idx, fref=1400., fast=True):
      """
@@ -363,7 +498,7 @@ def corr_from_psd_dm(toas, radio_freqs, freqs, psd, fref=1400., fast=True):
          A 2-dimensional array which represents the correlation matrix for the
          given set of TOAs.
      """
-     return corr_from_psd_chromatic(toas=toas, radio_freqs=radio_freqs, freqs=freqs, psd=psd, chr_idx=2.0, fref=fref, fast=fast)
+     return corr_from_psd_chromatic(toas=toas, radio_freqs=radio_freqs, freqs=freqs, psd=psd, chromatic_idx=2.0, fref=fref, fast=fast)
 
 
 def corr_from_psd_solar_wind(toas, radio_freqs, planetssb, sunssb, pos_t, freqs, psd, fast=True):
@@ -430,6 +565,51 @@ def corr_from_psd_solar_wind(toas, radio_freqs, planetssb, sunssb, pos_t, freqs,
         integrand = psd*jnp.cos(2*jnp.pi*freqs*tm[:,:,jnp.newaxis])#df*
         return A_matrix*jnp.trapz(integrand, axis=2, x=freqs)#np.sum(integrand,axis=2)#
 
+def get_solar_wind_designmatrix_columns(toas, radio_freqs, planetssb, sunssb, pos_t, bin_edges=None):
+    """
+    Calculates the correlation matrix over a set of TOAs for a given power
+    spectral density. Uses a solar wind basis.
+
+    Parameters
+    ----------
+
+    toas : array
+        Pulsar times-of-arrival to use in correlation matrix.
+
+    radio_freqs : array
+         observation frequency of each ToA
+    
+    planetssb : array
+
+    sunssb : array
+
+    pos_t : array
+
+    bin_edges : array [seconds]
+        Bins for a time dependent solar wind model. 
+
+    Returns
+    -------
+
+    corr : array
+        A 2-dimensional array which represents the correlation matrix for the
+        given set of TOAs.
+    """
+    sw_geometry = hutils.solar_wind_geometric_factor(radio_freqs, planetssb, sunssb, pos_t)
+    if bin_edges is None:
+        ### covers case where N_E is time independent. return single column
+        return np.array(sw_geometry).T
+    else: ## covers binned model case
+        Mmat_columns  = []
+        for ii, bin in enumerate(bin_edges[:-1]):
+            bin_mask = np.logical_and(toas >= bin, toas <= bin_edges[ii + 1])
+            if np.sum(bin_mask) != 0: # dont add a column if there are no toas in that bin
+                column = np.zeros(len(toas)) + bin_mask * sw_geometry
+                Mmat_columns.append(column)
+        
+            
+    return np.array(Mmat_columns).T # transpose to make it actually columns
+
 
 def get_noise_values(noise_dict, noise_tag):
     """
@@ -478,8 +658,9 @@ def hgw_calc(spectra, fyr):
     return hgw, plaw_h
 
 
-def make_corr(ePsr, noise_dict, freqs,
-              include_achrom_rn_corr=False,
+def make_hpsr(ePsr, noise_dict, freqs,
+              include_gwb_corr=True,
+              include_achrom_rn_corr=True,
               include_dmgp_corr=False,
               include_chromgp_corr=False,
               include_swgp_corr=False,
@@ -497,6 +678,12 @@ def make_corr(ePsr, noise_dict, freqs,
 
     freqs : array
         Array of freqs over which the psd is given.
+
+    include_gwb_corr: bool, optional
+        Option to include the gwb self-noise in the correlation matrix (always recommended).
+
+    include_achrom_rn_corr: bool, optional
+        Option to include the achromatic red noise in the correlation matrix (always recommended).
 
     include_dmgp_corr : bool, optional
         Option to include dm noise in the correlation matrix.
@@ -519,34 +706,50 @@ def make_corr(ePsr, noise_dict, freqs,
 
     """
     # thin the toas at the onset for maximal efficiency
-    ePsr.toas = ePsr.toas[::thin]
-    ePsr.toaerrs = ePsr.toaerrs[::thin]
-    ePsr.Mmat = ePsr.Mmat[::thin, :]
+    toas = ePsr.toas[::thin]
+    toaerrs = ePsr.toaerrs[::thin]
+    radio_freqs = ePsr.freqs[::thin]
+    Mmat = ePsr.Mmat[::thin, :]
+    if include_swgp_corr:
+        planet_ssb = ePsr.planetssb[::thin]
+        sunssb = ePsr.sunssb[::thin]
+        pos_t = ePsr.pos_t[::thin]
+
+    # get the flagging conventions for PTAs
+    flags_by_pta = get_flags_by_pta(psr=ePsr)
+    # get the unique frontend/backend combinations
+    unique_frontend_backend = noise_flags(flags_by_pta, psr=ePsr)
+    # create a new flag to use
+    febes = get_febes(ePsr)[::thin]
 
     rn_psrs = get_noise_values(noise_dict, 'red_noise')
     dm_n_psrs = get_noise_values(noise_dict, 'dm_gp')
     chrom_n_psrs = get_noise_values(noise_dict, 'chrom_gp')
     swgp_psrs = get_noise_values(noise_dict, 'sw_gp')
 
-    corr = white_noise_corr(ePsr,
+    corr = white_noise_corr(ePsr.name,
+                            toas,
+                            toaerrs,
+                            febes,
+                            unique_frontend_backend,
                             noise_dict,
                             equad_convention=equad_convention,
                             ecorr_settings=ecorr_settings)
-    plaw = hsen.red_noise_powerlaw(A_gwb=A_gwb, gamma_gwb=gamma_gwb, freqs=freqs)
-    corr += hsen.corr_from_psd(freqs=freqs, psd=plaw,
-                            toas=ePsr.toas)
+    if include_gwb_corr:
+        plaw_gwb = hsen.red_noise_powerlaw(A=A_gwb, gamma=gamma_gwb, freqs=freqs)
+        corr += hsen.corr_from_psd(freqs=freqs, psd=plaw_gwb, toas=toas)
 
     if include_achrom_rn_corr:
         if ePsr.name in rn_psrs.keys():
             Amp, gam = rn_psrs[ePsr.name]
             plaw_rn = hsen.red_noise_powerlaw(A=Amp, gamma=gam, freqs=freqs)
             corr += hsen.corr_from_psd(freqs=freqs, psd=plaw_rn,
-                            toas=ePsr.toas)
+                            toas=toas)
     if include_dmgp_corr:
         if ePsr.name in dm_n_psrs.keys():
             Amp, gam = dm_n_psrs[ePsr.name]
             plaw_dm = hsen.red_noise_powerlaw(A=Amp, gamma=gam, freqs=freqs)
-            corr += hsen.corr_from_psd_dm(ePsr.toas, ePsr.freqs, freqs, plaw_dm)
+            corr += corr_from_psd_dm(toas, radio_freqs, freqs, plaw_dm)
     if include_chromgp_corr:
         if ePsr.name in chrom_n_psrs.keys():
             Amp, gam = chrom_n_psrs[ePsr.name]
@@ -554,8 +757,8 @@ def make_corr(ePsr, noise_dict, freqs,
             if key_chrom_idx in noise_dict.keys():
                 plaw_chrom = hsen.red_noise_powerlaw(A=Amp, gamma=gam, freqs=freqs)
                 corr += corr_from_psd_dm(
-                    ePsr.toas,
-                    ePsr.freqs,
+                    toas,
+                    radio_freqs,
                     freqs,
                     plaw_chrom,
                     chromatic_index=noise_dict[key_chrom_idx]
@@ -563,8 +766,8 @@ def make_corr(ePsr, noise_dict, freqs,
             else:
                 plaw_chrom = hsen.red_noise_powerlaw(A=Amp, gamma=gam, freqs=freqs)
                 corr += corr_from_psd_chromatic(
-                    ePsr.toas,
-                    ePsr.freqs,
+                    toas,
+                    radio_freqs,
                     freqs,
                     psd=plaw_chrom,
                     index=4.
@@ -575,12 +778,23 @@ def make_corr(ePsr, noise_dict, freqs,
             key_chrom_idx = '{0}_sw_gp_idx'.format(ePsr.name)
             plaw_chrom = hsen.red_noise_powerlaw(A=Amp, gamma=gam, freqs=freqs)
             corr += corr_from_psd_solar_wind(
-                ePsr.toas,
-                ePsr.freqs,
+                toas,
+                radio_freqs,
+                planet_ssb,
+                sunssb,
+                pos_t,
                 freqs,
                 plaw_chrom,
                 )
-    return corr
+    hPsr = hsen.Pulsar(
+        toas=toas,
+        toaerrs=toaerrs,
+        phi=ePsr.phi,theta=ePsr.theta,
+        name=ePsr.name,
+        N=corr,
+        designmatrix=Mmat
+    )
+    return hPsr
 
 
 def calc_pta_gw(parpath, timpath, psrlist, noise, dm=False, chrom=False):
